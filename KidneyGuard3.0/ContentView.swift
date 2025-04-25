@@ -1,59 +1,72 @@
-import SwiftUI
-import UIKit
-import AVFoundation
-import Vision
-import CoreImage
-import Combine
+// MARK: - Framework Imports
+import SwiftUI            // SwiftUI for building declarative interfaces
+import UIKit               // UIKit to host UIViewController in SwiftUI
+import AVFoundation        // AVFoundation for camera capture and torch control
+import Vision              // Vision for contour detection
+import CoreImage           // CoreImage for image data handling
+import Combine             // Combine for reactive bindings
 
-// MARK: - ContentView: Displays the camera preview and performs analysis.
+// MARK: - ContentView: Hosts a UIViewController for camera preview and analysis
 struct ContentView: UIViewControllerRepresentable {
-    @Binding var pipetDiameter: String
-    @Binding var density: String   // Density in kg/m³
+    // User-provided inputs bound from SwiftUI
+    @Binding var pipetDiameter: String   // Diameter of pipette or straw (mm)
+    @Binding var density: String         // Liquid density (kg/m³)
 
-    // MARK: - Coordinator
+    // MARK: - Coordinator: Manages camera session, photo capture, and analysis
     class Coordinator: NSObject, AVCapturePhotoCaptureDelegate, ObservableObject {
+        // Camera session and photo output
         let session = AVCaptureSession()
         let output = AVCapturePhotoOutput()
-        var parent: ContentView
+        var parent: ContentView                 // Back-reference to ContentView
+
+        // Published property to update UI with measurement results
         @Published var surfaceTension: String = "Tap to measure"
-        var photoCompletion: ((UIImage) -> Void)?
-        var cancellables = Set<AnyCancellable>()
-        
-        // Keep a reference to the preview layer (needed for tap-to-focus).
+
+        // Closure to handle captured UIImage
+        private var photoCompletion: ((UIImage) -> Void)?
+        var cancellables = Set<AnyCancellable>() // Store Combine subscriptions
+
+        // Preview layer reference for tap-to-focus and zoom
         var previewLayer: AVCaptureVideoPreviewLayer?
-        
+
+        // MARK: Initializer
         init(parent: ContentView) {
             self.parent = parent
             super.init()
-            setupCamera()
-            checkPermissions()
+            setupCamera()      // Configure session input/output and device settings
+            checkPermissions() // Request camera access and start session
         }
-        
+
+        // MARK: Camera Setup
         func setupCamera() {
-            session.sessionPreset = .high
-            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera,
-                                                         for: .video,
-                                                         position: .back),
-                  let input = try? AVCaptureDeviceInput(device: device) else {
+            session.sessionPreset = .high  // High-resolution capture
+
+            // Select back wide-angle camera
+            guard let device = AVCaptureDevice.default(
+                    .builtInWideAngleCamera,
+                    for: .video,
+                    position: .back),
+                  let input = try? AVCaptureDeviceInput(device: device)
+            else {
                 print("Failed to get camera input")
                 return
             }
-            
-            // Configure focus and exposure for extremely close-up capture.
+
+            // Lock configuration to set focus/exposure and custom lens position
             do {
                 try device.lockForConfiguration()
-                // Center focus and exposure.
+                // Continuous auto-focus at center
                 if device.isFocusModeSupported(.continuousAutoFocus) {
-                    device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
                     device.focusMode = .continuousAutoFocus
+                    device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
                 }
+                // Continuous auto-exposure at center
                 if device.isExposureModeSupported(.continuousAutoExposure) {
-                    device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
                     device.exposureMode = .continuousAutoExposure
+                    device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
                 }
-                // For super close-up, set a very low lens position.
+                // For very close-up, lock lens position if supported
                 if device.isLockingFocusWithCustomLensPositionSupported {
-                    // API expects a Float; we directly declare desiredLensPosition as a Float.
                     let desiredLensPosition: Float = 0.05
                     device.setFocusModeLocked(lensPosition: desiredLensPosition, completionHandler: nil)
                 }
@@ -61,7 +74,8 @@ struct ContentView: UIViewControllerRepresentable {
             } catch {
                 print("Error configuring device: \(error)")
             }
-            
+
+            // Add input and output to the session
             if session.canAddInput(input) {
                 session.addInput(input)
             }
@@ -69,15 +83,18 @@ struct ContentView: UIViewControllerRepresentable {
                 session.addOutput(output)
             }
         }
-        
+
+        // MARK: Permissions and Session Control
         func checkPermissions() {
             let status = AVCaptureDevice.authorizationStatus(for: .video)
             switch status {
             case .authorized:
+                // Start session if already authorized
                 DispatchQueue.global(qos: .userInitiated).async {
                     self.session.startRunning()
                 }
             case .notDetermined:
+                // Request access if not determined
                 AVCaptureDevice.requestAccess(for: .video) { granted in
                     if granted {
                         DispatchQueue.global(qos: .userInitiated).async {
@@ -90,116 +107,137 @@ struct ContentView: UIViewControllerRepresentable {
                     }
                 }
             default:
+                // Denied or restricted
                 self.surfaceTension = "Camera access denied"
             }
         }
-        
+
+        // MARK: Photo Capture
         @objc func capturePhoto() {
             print("capturePhoto triggered")
             let settings = AVCapturePhotoSettings()
-            photoCompletion = { (image: UIImage) in
+
+            // Define completion to process captured image
+            photoCompletion = { image in
                 DispatchQueue.main.async {
-                    let result = self.calculateSurfaceTension(from: image,
-                                                              pipetDiameter: self.parent.pipetDiameter,
-                                                              density: self.parent.density)
+                    // Perform analysis using current inputs
+                    let result = self.calculateSurfaceTension(
+                        from: image,
+                        pipetDiameter: self.parent.pipetDiameter,
+                        density: self.parent.density)
                     print("Analysis result: \(String(describing: result))")
                     self.surfaceTension = result ?? "Measurement failed"
                 }
             }
+
+            // Trigger the photo capture
             output.capturePhoto(with: settings, delegate: self)
         }
-        
-        func photoOutput(_ output: AVCapturePhotoOutput,
-                         didFinishProcessingPhoto photo: AVCapturePhoto,
-                         error: Error?) {
+
+        // Delegate callback with processed photo
+        func photoOutput(
+            _ output: AVCapturePhotoOutput,
+            didFinishProcessingPhoto photo: AVCapturePhoto,
+            error: Error?
+        ) {
             if let error = error {
                 print("Error capturing photo: \(error.localizedDescription)")
                 return
             }
-            guard let data = photo.fileDataRepresentation(),
-                  let image = UIImage(data: data) else {
+            // Convert data to UIImage
+            guard
+                let data = photo.fileDataRepresentation(),
+                let image = UIImage(data: data)
+            else {
                 print("Failed to convert image data")
                 return
             }
+            // Call the completion handler
             photoCompletion?(image)
         }
-        
-        /// Uses Vision to detect the droplet, computes a scale factor from pipet diameter,
-        /// and calculates surface tension using the provided density.
-        func calculateSurfaceTension(from image: UIImage,
-                                     pipetDiameter: String,
-                                     density: String) -> String? {
+
+        // MARK: Surface Tension Analysis
+        /**
+         1. Detect droplet contour via Vision.
+         2. Compute mm-per-pixel scale using user pipetDiameter.
+         3. Compute droplet area (shoelace formula), convert to effective diameter.
+         4. Apply surface tension formula: γ = ρ·g·d_eff².
+         */
+        func calculateSurfaceTension(
+            from image: UIImage,
+            pipetDiameter: String,
+            density: String
+        ) -> String? {
+            // Ensure CGImage available for Vision
             guard let cgImage = image.cgImage else {
-                print("No CGImage found in image")
+                print("No CGImage found")
                 return nil
             }
-            
+
+            // Configure contour detection request
             let request = VNDetectContoursRequest()
             request.contrastAdjustment = 1.0
             request.detectDarkOnLight = true
             let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-            
+
             do {
+                // Perform Vision request
                 try handler.perform([request])
-                guard let observation = request.results?.first as? VNContoursObservation else {
-                    print("No contour observation found")
+                guard let obs = request.results?.first as? VNContoursObservation else {
+                    print("No contour results")
                     return nil
                 }
-                let contours = observation.topLevelContours
+                // Choose the largest contour (droplet)
+                let contours = obs.topLevelContours
                 guard let droplet = contours.max(by: { $0.pointCount < $1.pointCount }) else {
                     print("No droplet contour found")
                     return nil
                 }
-                let points = droplet.normalizedPoints
-                guard let minY = points.map({ CGFloat($0.y) }).min(),
-                      let maxY = points.map({ CGFloat($0.y) }).max(),
-                      let minX = points.map({ CGFloat($0.x) }).min(),
-                      let maxX = points.map({ CGFloat($0.x) }).max() else {
-                    print("Failed to determine bounding box")
-                    return nil
+                let normalizedPoints = droplet.normalizedPoints
+
+                // Convert normalized points to actual pixel coordinates
+                let pixelPoints = normalizedPoints.map { point in
+                    CGPoint(
+                        x: CGFloat(point.x) * CGFloat(cgImage.width),
+                        y: CGFloat(point.y) * CGFloat(cgImage.height)
+                    )
                 }
-                
-                let normalizedWidth: CGFloat = maxX - minX
-                let normalizedHeight: CGFloat = maxY - minY
-                
-                // Compute a scale factor (mm per pixel). Default: 0.01 mm/pixel if pipet diameter is invalid.
-                var scaleFactor: CGFloat = 0.01
-                if let d = Double(pipetDiameter), d > 0 {
-                    let measuredWidthPixels = normalizedWidth * CGFloat(cgImage.width)
-                    scaleFactor = CGFloat(d) / measuredWidthPixels
-                }
-                
-                // Convert normalized points to pixel coordinates.
-                let denormPoints = points.map { point in
-                    CGPoint(x: CGFloat(point.x) * CGFloat(cgImage.width),
-                            y: CGFloat(point.y) * CGFloat(cgImage.height))
-                }
-                // Compute droplet area (pixel²) using the Shoelace formula.
-                let areaPixels = polygonArea(points: denormPoints)
-                // Convert area to mm².
-                let areaMM = areaPixels * scaleFactor * scaleFactor
-                
-                // Derive effective diameter: d_eff = 2 * sqrt(area / π)
-                let effectiveDiameterMM = 2 * sqrt(areaMM / CGFloat.pi)
-                let effectiveDiameterM = Double(effectiveDiameterMM) / 1000.0
-                
-                print("Effective droplet diameter: \(effectiveDiameterMM) mm")
-                
-                // Use provided density, or default to water (1000 kg/m³).
-                let rho: Double = (Double(density) ?? 1000.0) > 0 ? Double(density)! : 1000.0
-                let g = 9.81  // m/s²
-                
-                // Calculate surface tension based on the effective diameter.
-                let tension = rho * g * effectiveDiameterM * effectiveDiameterM  // in N/m
-                
-                return String(format: "Surface Tension: %.1f mN/m", tension * 1000)
+
+                // Compute polygon area via Shoelace formula
+                let areaPixels = polygonArea(points: pixelPoints)
+
+                // Determine scale factor (mm per pixel)
+                let scale: CGFloat = {
+                    guard let d = Double(pipetDiameter), d > 0 else { return 0.01 }
+                    // Use bounding box width for scale
+                    let widths = normalizedPoints.map { CGFloat($0.x) }
+                    let minX = widths.min()!, maxX = widths.max()!
+                    let pixelWidth = (maxX - minX) * CGFloat(cgImage.width)
+                    return CGFloat(d) / pixelWidth
+                }()
+
+                // Convert area to mm²
+                let areaMM2 = areaPixels * scale * scale
+                // Compute effective diameter in mm: d_eff = 2 * sqrt(area/π)
+                let dEffMM = 2 * sqrt(areaMM2 / .pi)
+                let dEffM = Double(dEffMM) / 1000.0  // mm to meters
+                print("Effective droplet diameter: \(dEffMM) mm")
+
+                // Parse density or default to water
+                let rho = (Double(density) ?? 1000.0)
+                let g = 9.81
+                // Surface tension: γ = ρ·g·d_eff²
+                let gamma = rho * g * dEffM * dEffM
+                // Format as mN/m
+                return String(format: "Surface Tension: %.1f mN/m", gamma * 1000)
+
             } catch {
-                print("Error performing contour request: \(error.localizedDescription)")
+                print("Vision error: \(error.localizedDescription)")
                 return nil
             }
         }
-        
-        /// Computes the area of a polygon using the Shoelace formula.
+
+        // MARK: - Polygon Area Helper (Shoelace)
         func polygonArea(points: [CGPoint]) -> CGFloat {
             guard points.count > 2 else { return 0 }
             var area: CGFloat = 0
@@ -207,193 +245,175 @@ struct ContentView: UIViewControllerRepresentable {
                 let j = (i + 1) % points.count
                 area += points[i].x * points[j].y - points[j].x * points[i].y
             }
-            return abs(area) / 2.0
+            return abs(area) / 2
         }
-        
-        /// Toggles the flashlight (torch) on or off.
+
+        // MARK: - Flashlight Control
         @objc func toggleFlashlight() {
             guard let device = AVCaptureDevice.default(for: .video), device.hasTorch else { return }
             do {
                 try device.lockForConfiguration()
-                if device.torchMode == .on {
-                    device.torchMode = .off
-                } else {
-                    try device.setTorchModeOn(level: 1.0)
-                }
+                device.torchMode = (device.torchMode == .on ? .off : .on)
                 device.unlockForConfiguration()
             } catch {
                 print("Error toggling flashlight: \(error)")
             }
         }
+
+        // MARK: - Tap-to-Focus & Zoom
+        @objc func handleTap(_ sender: UITapGestureRecognizer) {
+            guard let view = sender.view, let preview = previewLayer else { return }
+            let tapPoint = sender.location(in: view)
+            let focusPoint = preview.captureDevicePointConverted(fromLayerPoint: tapPoint)
+            focusAndZoom(at: focusPoint)
+        }
+
+        func focusAndZoom(at focusPoint: CGPoint) {
+            guard let device = AVCaptureDevice.default(for: .video) else { return }
+            do {
+                try device.lockForConfiguration()
+                if device.isFocusPointOfInterestSupported {
+                    device.focusPointOfInterest = focusPoint
+                    device.focusMode = .autoFocus
+                }
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = focusPoint
+                    device.exposureMode = .continuousAutoExposure
+                }
+                // Apply 3x zoom (clamped to max)
+                let zoom: CGFloat = min(3.0, device.activeFormat.videoMaxZoomFactor)
+                device.videoZoomFactor = zoom
+                device.unlockForConfiguration()
+            } catch {
+                print("Error setting focus/zoom: \(error)")
+            }
+        }
     } // End Coordinator
 
-    func makeCoordinator() -> Coordinator {
-        return Coordinator(parent: self)
-    }
-    
-    func makeUIViewController(context: UIViewControllerRepresentableContext<ContentView>) -> UIViewController {
+    // MARK: Create and update UIViewController
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+    func makeUIViewController(
+        context: Context
+    ) -> UIViewController {
         let vc = UIViewController()
-        
-        // Set up the camera preview layer.
+
+        // Add preview layer for live camera
         let previewLayer = AVCaptureVideoPreviewLayer(session: context.coordinator.session)
-        previewLayer.videoGravity = .resizeAspectFill
         previewLayer.frame = vc.view.bounds
+        previewLayer.videoGravity = .resizeAspectFill
         vc.view.layer.addSublayer(previewLayer)
         context.coordinator.previewLayer = previewLayer
-        
-        // Add tap gesture recognizer for tap-to-focus/zoom.
-        let tapRecognizer = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
-        vc.view.addGestureRecognizer(tapRecognizer)
-        
-        // Create a button to capture a photo.
+
+        // Gesture recognizer for tap-to-focus/zoom
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
+        vc.view.addGestureRecognizer(tap)
+
+        // Analysis button setup
         let analysisButton = UIButton(type: .system)
         analysisButton.setTitle("Start Analysis", for: .normal)
-        analysisButton.backgroundColor = UIColor.systemBlue
-        analysisButton.setTitleColor(UIColor.white, for: .normal)
+        analysisButton.backgroundColor = .systemBlue
+        analysisButton.setTitleColor(.white, for: .normal)
         analysisButton.layer.cornerRadius = 8
-        analysisButton.clipsToBounds = true
-        analysisButton.addTarget(context.coordinator,
-                                 action: #selector(Coordinator.capturePhoto),
-                                 for: .touchUpInside)
         analysisButton.translatesAutoresizingMaskIntoConstraints = false
+        analysisButton.addTarget(
+            context.coordinator, action: #selector(Coordinator.capturePhoto), for: .touchUpInside)
         vc.view.addSubview(analysisButton)
-        
         NSLayoutConstraint.activate([
             analysisButton.leadingAnchor.constraint(equalTo: vc.view.leadingAnchor, constant: 20),
             analysisButton.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor, constant: -20),
             analysisButton.bottomAnchor.constraint(equalTo: vc.view.bottomAnchor, constant: -120),
             analysisButton.heightAnchor.constraint(equalToConstant: 40)
         ])
-        
-        // Create a flashlight toggle button.
+
+        // Flashlight toggle button
         let flashlightButton = UIButton(type: .system)
         flashlightButton.setTitle("Toggle Flashlight", for: .normal)
-        flashlightButton.backgroundColor = UIColor.systemYellow
-        flashlightButton.setTitleColor(UIColor.black, for: .normal)
+        flashlightButton.backgroundColor = .systemYellow
+        flashlightButton.setTitleColor(.black, for: .normal)
         flashlightButton.layer.cornerRadius = 8
-        flashlightButton.clipsToBounds = true
-        flashlightButton.addTarget(context.coordinator,
-                                     action: #selector(Coordinator.toggleFlashlight),
-                                     for: .touchUpInside)
         flashlightButton.translatesAutoresizingMaskIntoConstraints = false
+        flashlightButton.addTarget(
+            context.coordinator, action: #selector(Coordinator.toggleFlashlight), for: .touchUpInside)
         vc.view.addSubview(flashlightButton)
-        
         NSLayoutConstraint.activate([
             flashlightButton.leadingAnchor.constraint(equalTo: vc.view.leadingAnchor, constant: 20),
             flashlightButton.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor, constant: -20),
             flashlightButton.bottomAnchor.constraint(equalTo: analysisButton.topAnchor, constant: -10),
             flashlightButton.heightAnchor.constraint(equalToConstant: 40)
         ])
-        
-        // Create a label to display the measurement result.
+
+        // Label to display surface tension result
         let label = UILabel()
         label.textAlignment = .center
-        label.textColor = UIColor.white
+        label.textColor = .white
         label.backgroundColor = UIColor.black.withAlphaComponent(0.7)
         label.layer.cornerRadius = 8
         label.clipsToBounds = true
         label.translatesAutoresizingMaskIntoConstraints = false
         vc.view.addSubview(label)
-        
         NSLayoutConstraint.activate([
             label.leadingAnchor.constraint(equalTo: vc.view.leadingAnchor, constant: 20),
             label.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor, constant: -20),
             label.bottomAnchor.constraint(equalTo: vc.view.bottomAnchor, constant: -60),
             label.heightAnchor.constraint(equalToConstant: 40)
         ])
-        
+
+        // Bind surfaceTension publisher to label text
         context.coordinator.$surfaceTension
             .receive(on: DispatchQueue.main)
-            .sink { text in
-                label.text = text
-            }
+            .sink { text in label.text = text }
             .store(in: &context.coordinator.cancellables)
-        
+
         return vc
     }
-    
-    func updateUIViewController(_ uiViewController: UIViewController,
-                                context: UIViewControllerRepresentableContext<ContentView>) {
-        // No dynamic updates needed.
-    }
+    func updateUIViewController(_ uiViewController: UIViewController, context: Context) {}
 }
 
-// MARK: - Tap Handler Extension
-extension ContentView.Coordinator {
-    @objc func handleTap(_ sender: UITapGestureRecognizer) {
-        guard let view = sender.view else { return }
-        let location = sender.location(in: view)
-        focusAndZoom(at: location, in: view)
-    }
-    
-    func focusAndZoom(at point: CGPoint, in view: UIView) {
-        guard let device = AVCaptureDevice.default(for: .video),
-              let previewLayer = self.previewLayer else { return }
-        let focusPoint = previewLayer.captureDevicePointConverted(fromLayerPoint: point)
-        
-        do {
-            try device.lockForConfiguration()
-            if device.isFocusPointOfInterestSupported {
-                device.focusPointOfInterest = focusPoint
-                device.focusMode = .autoFocus
-            }
-            if device.isExposurePointOfInterestSupported {
-                device.exposurePointOfInterest = focusPoint
-                device.exposureMode = .continuousAutoExposure
-            }
-            // Set a zoom factor (e.g., 3x).
-            let desiredZoomFactor: CGFloat = 3.0
-            let maxZoom = device.activeFormat.videoMaxZoomFactor
-            device.videoZoomFactor = min(desiredZoomFactor, maxZoom)
-            device.unlockForConfiguration()
-        } catch {
-            print("Error setting focus/zoom: \(error)")
-        }
-    }
-}
-
-// MARK: - MainView: Provides input fields and embeds ContentView.
+// MARK: - MainView: SwiftUI root providing input fields and embedding ContentView
 struct MainView: View {
-    @State private var pipetDiameter: String = ""
-    @State private var density: String = ""
-    
+    @State private var pipetDiameter: String = ""  // User enters diameter
+    @State private var density: String = ""        // User enters density
+
     var body: some View {
         VStack {
+            // Input for pipette diameter
             TextField("Enter pipet diameter (mm)", text: $pipetDiameter)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
-                .padding()
                 .keyboardType(.decimalPad)
+                .padding()
                 .toolbar {
                     ToolbarItemGroup(placement: .keyboard) {
                         Spacer()
                         Button("Done") {
-                            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
-                                                              to: nil, from: nil, for: nil)
+                            UIApplication.shared.sendAction(
+                                #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                         }
                     }
                 }
+            // Input for liquid density
             TextField("Enter density (kg/m³)", text: $density)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
-                .padding([.horizontal, .bottom])
                 .keyboardType(.decimalPad)
+                .padding([.horizontal, .bottom])
                 .toolbar {
                     ToolbarItemGroup(placement: .keyboard) {
                         Spacer()
                         Button("Done") {
-                            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
-                                                              to: nil, from: nil, for: nil)
+                            UIApplication.shared.sendAction(
+                                #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                         }
                     }
                 }
+            // Embed the camera analysis view
             ContentView(pipetDiameter: $pipetDiameter, density: $density)
                 .edgesIgnoringSafeArea(.all)
         }
     }
 }
 
+// MARK: - Preview
 struct MainView_Previews: PreviewProvider {
     static var previews: some View {
         MainView()
     }
 }
-  
