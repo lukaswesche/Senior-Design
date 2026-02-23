@@ -20,6 +20,7 @@ struct ContentView: UIViewControllerRepresentable {
         var parent: ContentView
 
         @Published var surfaceTension: String = "Tap to measure"
+	@Published var containerFound: Bool = true
 
         private var photoCompletion: ((UIImage) -> Void)?
         var cancellables = Set<AnyCancellable>()
@@ -31,6 +32,81 @@ struct ContentView: UIViewControllerRepresentable {
             setupCamera()
             checkPermissions()
         }
+func validateContainer(from contour: VNContour,
+                       imageSize: CGSize) -> Bool {
+
+    let bbox = contour.boundingBox
+
+    // Must take up enough vertical space
+    guard bbox.height > 0.30 else { return false }
+
+    // Must be taller than wide (cup or tube)
+    guard bbox.height > bbox.width else { return false }
+
+    let points = contour.normalizedPoints.map {
+        CGPoint(
+            x: CGFloat($0.x) * imageSize.width,
+            y: CGFloat($0.y) * imageSize.height
+        )
+    }
+
+    guard points.count > 200 else { return false }
+
+    // Bounding extents
+    guard let minX = points.map({ $0.x }).min(),
+          let maxX = points.map({ $0.x }).max(),
+          let minY = points.map({ $0.y }).min(),
+          let maxY = points.map({ $0.y }).max()
+    else { return false }
+
+    let midX = (minX + maxX) / 2
+    let imageMidX = imageSize.width / 2
+
+    // Must be roughly centered in frame
+    guard abs(midX - imageMidX) < imageSize.width * 0.25 else {
+        return false
+    }
+
+    // Check vertical width consistency (cylindrical shape)
+    let height = maxY - minY
+    let slices = 6
+    var widths: [CGFloat] = []
+
+    for i in 0..<slices {
+        let yLevel = minY + (CGFloat(i) / CGFloat(slices - 1)) * height
+
+        let slicePoints = points.filter {
+            abs($0.y - yLevel) < height * 0.03
+        }
+
+        guard slicePoints.count > 5 else { continue }
+
+        let xs = slicePoints.map { $0.x }
+        if let minSliceX = xs.min(),
+           let maxSliceX = xs.max() {
+            widths.append(maxSliceX - minSliceX)
+        }
+    }
+
+    guard widths.count >= 3 else { return false }
+
+    let avgWidth = widths.reduce(0, +) / CGFloat(widths.count)
+    let variance = widths.map { abs($0 - avgWidth) }
+                         .reduce(0, +) / CGFloat(widths.count)
+
+    guard variance < avgWidth * 0.25 else { return false }
+
+    // Left-right symmetry check
+    let leftPoints = points.filter { $0.x < midX }
+    let rightPoints = points.filter { $0.x > midX }
+
+    guard abs(leftPoints.count - rightPoints.count)
+            < CGFloat(points.count) * 0.20 else {
+        return false
+    }
+
+    return true
+}
 
         // MARK: Camera Setup
         func setupCamera() {
@@ -167,13 +243,32 @@ struct ContentView: UIViewControllerRepresentable {
             do {
                 try handler.perform([request])
 
-                guard let obs = request.results?.first as? VNContoursObservation else {
-                    return nil
-                }
+               guard let obs = request.results?.first as? VNContoursObservation else {
+    		DispatchQueue.main.async {
+        	self.containerFound = false
+    		}
+   		 return nil
+		}
 
-                guard let droplet = obs.topLevelContours.max(by: { $0.pointCount < $1.pointCount }) else {
-                    return nil
-                }
+               guard let droplet = obs.topLevelContours.max(by: { $0.pointCount < $1.pointCount }) else {
+    		DispatchQueue.main.async {
+       		 self.containerFound = false
+   		 }
+  		  return nil
+		}
+		let isValidContainer = validateContainer(
+    		from: droplet,
+   		 imageSize: CGSize(width: cgImage.width,
+                      height: cgImage.height)
+		)
+
+		DispatchQueue.main.async {
+   		 self.containerFound = isValidContainer
+		}
+
+		guard isValidContainer else {
+   		 return nil
+		}
 
                 let pixelPoints = droplet.normalizedPoints.map {
                     CGPoint(
