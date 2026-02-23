@@ -432,21 +432,38 @@ struct MainView: View {
     @State private var pipetDiameter: String = ""
     @State private var density: String = ""
 
+    // For dismissing the decimalPad keyboard
+    @FocusState private var focusedField: Field?
+    enum Field { case pipet, density }
+
     var body: some View {
         VStack {
             TextField("Enter pipet diameter (mm)", text: $pipetDiameter)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .keyboardType(.decimalPad)
+                .focused($focusedField, equals: .pipet)
                 .padding()
 
             TextField("Enter density (kg/m³)", text: $density)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .keyboardType(.decimalPad)
+                .focused($focusedField, equals: .density)
                 .padding([.horizontal, .bottom])
 
             ContentView(pipetDiameter: $pipetDiameter,
                         density: $density)
                 .edgesIgnoringSafeArea(.all)
+        }
+        // Adds a "Done" button above the number pad
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") { focusedField = nil }
+            }
+        }
+        // Optional: tap anywhere in this VStack to dismiss keyboard
+        .onTapGesture {
+            focusedField = nil
         }
     }
 }
