@@ -20,7 +20,7 @@ struct ContentView: UIViewControllerRepresentable {
         var parent: ContentView
 
         @Published var surfaceTension: String = "Tap to measure"
-	@Published var containerFound: Bool = true
+        @Published var containerFound: Bool = true
 
         private var photoCompletion: ((UIImage) -> Void)?
         var cancellables = Set<AnyCancellable>()
@@ -32,81 +32,128 @@ struct ContentView: UIViewControllerRepresentable {
             setupCamera()
             checkPermissions()
         }
-func validateContainer(from contour: VNContour,
-                       imageSize: CGSize) -> Bool {
 
-    let bbox = contour.boundingBox
+        // MARK: - Container Validation (manual bounding box + simpler math)
+        func validateContainer(from contour: VNContour, imageSize: CGSize) -> Bool {
 
-    // Must take up enough vertical space
-    guard bbox.height > 0.30 else { return false }
+            let normalized = contour.normalizedPoints
+            let nCount = normalized.count
+            guard nCount > 200 else { return false }
 
-    // Must be taller than wide (cup or tube)
-    guard bbox.height > bbox.width else { return false }
+            // ---- Manual bounding box in normalized (0..1) space ----
+            var minX: CGFloat = 1
+            var maxX: CGFloat = 0
+            var minY: CGFloat = 1
+            var maxY: CGFloat = 0
 
-    let points = contour.normalizedPoints.map {
-        CGPoint(
-            x: CGFloat($0.x) * imageSize.width,
-            y: CGFloat($0.y) * imageSize.height
-        )
-    }
+            for p in normalized {
+                let x = CGFloat(p.x)
+                let y = CGFloat(p.y)
+                if x < minX { minX = x }
+                if x > maxX { maxX = x }
+                if y < minY { minY = y }
+                if y > maxY { maxY = y }
+            }
 
-    guard points.count > 200 else { return false }
+            let boxWidth = maxX - minX
+            let boxHeight = maxY - minY
 
-    // Bounding extents
-    guard let minX = points.map({ $0.x }).min(),
-          let maxX = points.map({ $0.x }).max(),
-          let minY = points.map({ $0.y }).min(),
-          let maxY = points.map({ $0.y }).max()
-    else { return false }
+            // Must take up enough vertical space
+            if boxHeight <= 0.30 { return false }
 
-    let midX = (minX + maxX) / 2
-    let imageMidX = imageSize.width / 2
+            // Must be taller than wide (cup/tube-ish)
+            if boxHeight <= boxWidth { return false }
 
-    // Must be roughly centered in frame
-    guard abs(midX - imageMidX) < imageSize.width * 0.25 else {
-        return false
-    }
+            // Convert to pixel points once for remaining checks
+            let w = imageSize.width
+            let h = imageSize.height
 
-    // Check vertical width consistency (cylindrical shape)
-    let height = maxY - minY
-    let slices = 6
-    var widths: [CGFloat] = []
+            var points: [CGPoint] = []
+            points.reserveCapacity(nCount)
 
-    for i in 0..<slices {
-        let yLevel = minY + (CGFloat(i) / CGFloat(slices - 1)) * height
+            for p in normalized {
+                points.append(CGPoint(x: CGFloat(p.x) * w, y: CGFloat(p.y) * h))
+            }
 
-        let slicePoints = points.filter {
-            abs($0.y - yLevel) < height * 0.03
+            // Pixel extents
+            var pMinX = CGFloat.greatestFiniteMagnitude
+            var pMaxX = -CGFloat.greatestFiniteMagnitude
+            var pMinY = CGFloat.greatestFiniteMagnitude
+            var pMaxY = -CGFloat.greatestFiniteMagnitude
+
+            for pt in points {
+                if pt.x < pMinX { pMinX = pt.x }
+                if pt.x > pMaxX { pMaxX = pt.x }
+                if pt.y < pMinY { pMinY = pt.y }
+                if pt.y > pMaxY { pMaxY = pt.y }
+            }
+
+            if !(pMinX.isFinite && pMaxX.isFinite && pMinY.isFinite && pMaxY.isFinite) { return false }
+
+            let midX = (pMinX + pMaxX) * 0.5
+            let imageMidX = w * 0.5
+
+            // Must be roughly centered
+            if abs(midX - imageMidX) >= w * 0.25 { return false }
+
+            // Check vertical width consistency (cylindrical-ish)
+            let heightPx = pMaxY - pMinY
+            if heightPx <= 0 { return false }
+
+            let slices = 6
+            let yTolerance = heightPx * 0.03
+
+            var widths: [CGFloat] = []
+            widths.reserveCapacity(slices)
+
+            for i in 0..<slices {
+                let t = CGFloat(i) / CGFloat(max(slices - 1, 1))
+                let yLevel = pMinY + t * heightPx
+
+                var sliceMinX = CGFloat.greatestFiniteMagnitude
+                var sliceMaxX = -CGFloat.greatestFiniteMagnitude
+                var sliceCount = 0
+
+                for pt in points {
+                    if abs(pt.y - yLevel) < yTolerance {
+                        sliceCount += 1
+                        if pt.x < sliceMinX { sliceMinX = pt.x }
+                        if pt.x > sliceMaxX { sliceMaxX = pt.x }
+                    }
+                }
+
+                if sliceCount > 5, sliceMinX.isFinite, sliceMaxX.isFinite {
+                    widths.append(sliceMaxX - sliceMinX)
+                }
+            }
+
+            if widths.count < 3 { return false }
+
+            var sum: CGFloat = 0
+            for v in widths { sum += v }
+            let avgWidth = sum / CGFloat(widths.count)
+            if avgWidth <= 0 { return false }
+
+            var devSum: CGFloat = 0
+            for v in widths { devSum += abs(v - avgWidth) }
+            let variance = devSum / CGFloat(widths.count)
+
+            if variance >= avgWidth * 0.25 { return false }
+
+            // Left-right symmetry check
+            var leftCount = 0
+            var rightCount = 0
+
+            for pt in points {
+                if pt.x < midX { leftCount += 1 }
+                else if pt.x > midX { rightCount += 1 }
+            }
+
+            let diff = abs(leftCount - rightCount)
+            if CGFloat(diff) >= CGFloat(points.count) * 0.20 { return false }
+
+            return true
         }
-
-        guard slicePoints.count > 5 else { continue }
-
-        let xs = slicePoints.map { $0.x }
-        if let minSliceX = xs.min(),
-           let maxSliceX = xs.max() {
-            widths.append(maxSliceX - minSliceX)
-        }
-    }
-
-    guard widths.count >= 3 else { return false }
-
-    let avgWidth = widths.reduce(0, +) / CGFloat(widths.count)
-    let variance = widths.map { abs($0 - avgWidth) }
-                         .reduce(0, +) / CGFloat(widths.count)
-
-    guard variance < avgWidth * 0.25 else { return false }
-
-    // Left-right symmetry check
-    let leftPoints = points.filter { $0.x < midX }
-    let rightPoints = points.filter { $0.x > midX }
-
-    guard abs(leftPoints.count - rightPoints.count)
-            < CGFloat(points.count) * 0.20 else {
-        return false
-    }
-
-    return true
-}
 
         // MARK: Camera Setup
         func setupCamera() {
@@ -243,34 +290,28 @@ func validateContainer(from contour: VNContour,
             do {
                 try handler.perform([request])
 
-               guard let obs = request.results?.first as? VNContoursObservation else {
-    		DispatchQueue.main.async {
-        	self.containerFound = false
-    		}
-   		 return nil
-		}
+                guard let obs = request.results?.first as? VNContoursObservation else {
+                    DispatchQueue.main.async { self.containerFound = false }
+                    return nil
+                }
 
-               guard let droplet = obs.topLevelContours.max(by: { $0.pointCount < $1.pointCount }) else {
-    		DispatchQueue.main.async {
-       		 self.containerFound = false
-   		 }
-  		  return nil
-		}
-		let isValidContainer = validateContainer(
-    		from: droplet,
-   		 imageSize: CGSize(width: cgImage.width,
-                      height: cgImage.height)
-		)
+                guard let contour = obs.topLevelContours.max(by: { $0.pointCount < $1.pointCount }) else {
+                    DispatchQueue.main.async { self.containerFound = false }
+                    return nil
+                }
 
-		DispatchQueue.main.async {
-   		 self.containerFound = isValidContainer
-		}
+                let isValidContainer = validateContainer(
+                    from: contour,
+                    imageSize: CGSize(width: cgImage.width, height: cgImage.height)
+                )
 
-		guard isValidContainer else {
-   		 return nil
-		}
+                DispatchQueue.main.async {
+                    self.containerFound = isValidContainer
+                }
 
-                let pixelPoints = droplet.normalizedPoints.map {
+                guard isValidContainer else { return nil }
+
+                let pixelPoints = contour.normalizedPoints.map {
                     CGPoint(
                         x: CGFloat($0.x) * CGFloat(cgImage.width),
                         y: CGFloat($0.y) * CGFloat(cgImage.height)
@@ -306,17 +347,13 @@ func validateContainer(from contour: VNContour,
                 let scaleMMPerPixel = CGFloat(d) / strawPixelWidth
 
                 // ---- ROBUST APEX SELECTION ----
-                // Find top of droplet
                 guard let minY2 = pixelPoints.map({ $0.y }).min() else { return nil }
-
-                // Define small vertical band below apex
                 let apexBandHeight = CGFloat(cgImage.height) * 0.025
 
                 let apexPoints = pixelPoints.filter {
                     $0.y >= minY2 && $0.y <= (minY2 + apexBandHeight)
                 }
 
-                // Ensure we have enough curvature points
                 guard apexPoints.count > 5 else { return nil }
 
                 guard let radiusPixels = fitCircleRadius(points: apexPoints) else {
@@ -331,7 +368,6 @@ func validateContainer(from contour: VNContour,
                 let g = 9.81
 
                 let gamma = (rho * g * radiusMeters * radiusMeters) / 2.0
-
                 return String(format: "Surface Tension: %.2f mN/m", gamma * 1000)
 
             } catch {
@@ -527,7 +563,6 @@ struct MainView: View {
     @State private var pipetDiameter: String = ""
     @State private var density: String = ""
 
-    // For dismissing the decimalPad keyboard
     @FocusState private var focusedField: Field?
     enum Field { case pipet, density }
 
@@ -549,14 +584,12 @@ struct MainView: View {
                         density: $density)
                 .edgesIgnoringSafeArea(.all)
         }
-        // Adds a "Done" button above the number pad
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
                 Button("Done") { focusedField = nil }
             }
         }
-        // Optional: tap anywhere in this VStack to dismiss keyboard
         .onTapGesture {
             focusedField = nil
         }
