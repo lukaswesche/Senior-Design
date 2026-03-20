@@ -7,6 +7,15 @@ import Combine
 import CoreImage
 import CoreImage.CIFilterBuiltins
 
+// MARK: - MeasurementRecord
+struct MeasurementRecord {
+    let timestamp: Date
+    let pipetDiameter: String
+    let density: String
+    let surfaceTension: String
+    let surfaceTensionValue: Double
+}
+
 // MARK: - ContentView
 struct ContentView: UIViewControllerRepresentable {
 
@@ -21,6 +30,9 @@ struct ContentView: UIViewControllerRepresentable {
 
         @Published var surfaceTension: String = "Tap to measure"
         @Published var containerFound: Bool = true
+
+        var measurementHistory: [MeasurementRecord] = []
+        weak var viewController: UIViewController?
 
         private var photoCompletion: ((UIImage) -> Void)?
         var cancellables = Set<AnyCancellable>()
@@ -222,12 +234,82 @@ struct ContentView: UIViewControllerRepresentable {
                     )
 
                     DispatchQueue.main.async {
-                        self.surfaceTension = result ?? "Measurement failed"
+                        if let result = result {
+                            self.surfaceTension = result.display
+                            let record = MeasurementRecord(
+                                timestamp: Date(),
+                                pipetDiameter: self.parent.pipetDiameter,
+                                density: self.parent.density,
+                                surfaceTension: result.display,
+                                surfaceTensionValue: result.value
+                            )
+                            self.measurementHistory.append(record)
+                        } else {
+                            self.surfaceTension = "Measurement failed"
+                        }
                     }
                 }
             }
 
             output.capturePhoto(with: settings, delegate: self)
+        }
+
+        // MARK: Download Results
+        @objc func downloadResults() {
+            guard !measurementHistory.isEmpty else {
+                guard let vc = viewController else { return }
+                let alert = UIAlertController(
+                    title: "No Data",
+                    message: "No measurements recorded yet. Run at least one analysis first.",
+                    preferredStyle: .alert
+                )
+                alert.addAction(UIAlertAction(title: "OK", style: .default))
+                vc.present(alert, animated: true)
+                return
+            }
+
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+
+            var csv = "Timestamp,Pipet Diameter (mm),Density (kg/m³),Surface Tension (mN/m)\n"
+            for record in measurementHistory {
+                let ts = formatter.string(from: record.timestamp)
+                csv += "\(ts),\(record.pipetDiameter),\(record.density),\(String(format: "%.2f", record.surfaceTensionValue))\n"
+            }
+
+            let tmpURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("KidneyGuard_Results.csv")
+
+            do {
+                try csv.write(to: tmpURL, atomically: true, encoding: .utf8)
+            } catch {
+                guard let vc = viewController else { return }
+                let alert = UIAlertController(
+                    title: "Export Failed",
+                    message: "Could not create the results file. Please try again.",
+                    preferredStyle: .alert
+                )
+                alert.addAction(UIAlertAction(title: "OK", style: .default))
+                vc.present(alert, animated: true)
+                return
+            }
+
+            guard let vc = viewController else { return }
+            let activityVC = UIActivityViewController(
+                activityItems: [tmpURL],
+                applicationActivities: nil
+            )
+            if let popover = activityVC.popoverPresentationController {
+                popover.sourceView = vc.view
+                popover.sourceRect = CGRect(
+                    x: vc.view.bounds.midX,
+                    y: vc.view.bounds.midY,
+                    width: 0,
+                    height: 0
+                )
+                popover.permittedArrowDirections = []
+            }
+            vc.present(activityVC, animated: true)
         }
 
         func photoOutput(
@@ -247,7 +329,7 @@ struct ContentView: UIViewControllerRepresentable {
             from image: UIImage,
             pipetDiameter: String,
             density: String
-        ) -> String? {
+        ) -> (display: String, value: Double)? {
 
             guard let cgImage = image.cgImage else { return nil }
 
@@ -368,7 +450,11 @@ struct ContentView: UIViewControllerRepresentable {
                 let g = 9.81
 
                 let gamma = (rho * g * radiusMeters * radiusMeters) / 2.0
-                return String(format: "Surface Tension: %.2f mN/m", gamma * 1000)
+                let gammaMNm = gamma * 1000
+                return (
+                    display: String(format: "Surface Tension: %.2f mN/m", gammaMNm),
+                    value: gammaMNm
+                )
 
             } catch {
                 return nil
@@ -476,6 +562,7 @@ struct ContentView: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> UIViewController {
         let vc = UIViewController()
+        context.coordinator.viewController = vc
 
         let previewLayer = AVCaptureVideoPreviewLayer(session: context.coordinator.session)
         previewLayer.frame = vc.view.bounds
@@ -529,6 +616,27 @@ struct ContentView: UIViewControllerRepresentable {
             flashlightButton.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor, constant: -20),
             flashlightButton.bottomAnchor.constraint(equalTo: analysisButton.topAnchor, constant: -10),
             flashlightButton.heightAnchor.constraint(equalToConstant: 40)
+        ])
+
+        let downloadButton = UIButton(type: .system)
+        downloadButton.setTitle("Download Results", for: .normal)
+        downloadButton.backgroundColor = .systemGreen
+        downloadButton.setTitleColor(.white, for: .normal)
+        downloadButton.layer.cornerRadius = 8
+        downloadButton.translatesAutoresizingMaskIntoConstraints = false
+        downloadButton.addTarget(
+            context.coordinator,
+            action: #selector(Coordinator.downloadResults),
+            for: .touchUpInside
+        )
+
+        vc.view.addSubview(downloadButton)
+
+        NSLayoutConstraint.activate([
+            downloadButton.leadingAnchor.constraint(equalTo: vc.view.leadingAnchor, constant: 20),
+            downloadButton.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor, constant: -20),
+            downloadButton.bottomAnchor.constraint(equalTo: flashlightButton.topAnchor, constant: -10),
+            downloadButton.heightAnchor.constraint(equalToConstant: 40)
         ])
 
         let label = UILabel()
